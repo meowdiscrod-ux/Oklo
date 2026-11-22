@@ -21,23 +21,22 @@ jobs:
 
       - name: Unzip project
         run: |
-          Z=""
-          while IFS= read -r f; do
-            if unzip -Z1 "$f" 2>/dev/null | grep -qx 'build.gradle'; then Z="$f"; break; fi
-          done < <(find . -name '*.zip' -not -path './.git/*')
+          Z=$(find . -name 'meow-liquid-v2.zip' -not -path './.git/*' | head -1)
           if [ -z "$Z" ]; then
-            echo "NO PROJECT ZIP FOUND. Upload meow-liquid-all.zip to the repo root."
-            find . -not -path './.git/*' -type f | head -50
+            echo "meow-liquid-v2.zip NOT FOUND in the repo"
             exit 1
           fi
-          echo "Using $Z"
           mkdir -p proj
           unzip -o -q "$Z" -d proj
-          ls -la proj proj/libs
 
       - name: Build jar
+        shell: bash
         working-directory: proj
-        run: gradle meowJar --no-daemon
+        run: gradle meowJar --no-daemon 2>&1 | tee build.log
+
+      - name: Show errors
+        if: failure()
+        run: grep -n -A4 'error:' proj/build.log | head -60
 
       - uses: actions/upload-artifact@v4
         with:
