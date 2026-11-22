@@ -1,0 +1,855 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Write project files
+        run: |
+          set -e
+          mkdir -p libs src/main/java/cc/mochi/liquid src/main/resources/assets/mochi/font
+          # find your original jar: inside the uploaded zip, or any jar in the repo root
+          if ls meow-liquid-build*.zip >/dev/null 2>&1; then unzip -p meow-liquid-build*.zip libs/meow-original.jar > libs/meow-original.jar; fi
+          if [ ! -s libs/meow-original.jar ]; then cp "$(ls *.jar | head -1)" libs/meow-original.jar; fi
+          unzip -p libs/meow-original.jar assets/mochi/fonts/Inter.ttf > src/main/resources/assets/mochi/font/Inter.ttf
+          ls -la libs src/main/resources/assets/mochi/font
+          cat > build.gradle <<'EOF_0'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          base { archivesName = 'meow-client' }
+          version = 'liquid'
+
+          repositories { mavenCentral() }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              // your original compiled client (cc.mochi.*), used only to compile against
+              modCompileOnly files('libs/meow-original.jar')
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          tasks.withType(JavaCompile).configureEach { options.release = 21 }
+
+          // Final jar = new Liquid GUI classes (remapped) + your original jar,
+          // with the new MeowMenu replacing the old one. Everything else is kept untouched.
+          tasks.register('meowJar', Jar) {
+              dependsOn remapJar
+              archiveFileName = 'meow-client-liquid.jar'
+              destinationDirectory = layout.buildDirectory.dir('libs')
+              duplicatesStrategy = DuplicatesStrategy.EXCLUDE   // first source wins
+              from({ zipTree(remapJar.archiveFile.get().asFile) }) {
+                  exclude 'META-INF/MANIFEST.MF'
+              }
+              from({ zipTree('libs/meow-original.jar') }) {
+                  exclude 'cc/mochi/MeowMenu.class'
+              }
+          }
+          EOF_0
+          cat > settings.gradle <<'EOF_1'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'meow-client'
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2G
+          # Check https://fabricmc.net/develop for the exact Yarn build if this one is not found
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.3
+          loader_version=0.18.2
+          EOF_2
+          cat > src/main/java/cc/mochi/MeowMenu.java <<'EOF_3'
+          package cc.mochi;
+
+          import cc.mochi.liquid.LiquidGuiScreen;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.Screen;
+
+          /** Replaces the old MeowMenu: same signatures, now opens the Liquid GUI instead of dev.field's FieldScreen. */
+          public final class MeowMenu {
+              private MeowMenu() {}
+
+              public static void open(MinecraftClient mc) { open(mc, null); }
+
+              public static void open(MinecraftClient mc, Screen parent) {
+                  if (MochiClient.INSTANCE == null || mc == null || mc.currentScreen != parent) return;
+                  mc.setScreen(new LiquidGuiScreen());
+              }
+          }
+          EOF_3
+          cat > src/main/java/cc/mochi/liquid/Gfx.java <<'EOF_4'
+          package cc.mochi.liquid;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.font.TextRenderer;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.text.Style;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Identifier;
+
+          import java.util.HashMap;
+          import java.util.Map;
+
+          /**
+           * Drawing adapter. EVERY Minecraft call used by the Liquid GUI lives in this file,
+           * so if your mappings differ (Yarn vs Mojang) this is the only file to touch.
+           * Shapes are built from fills only, so they work on any GPU/driver, including Android.
+           */
+          public final class Gfx {
+              private static DrawContext ctx;
+              private static final Map<String, Text> TEXT_CACHE = new HashMap<>();
+              /** Font definition: assets/mochi/font/liquid.json (Inter, already in your jar). */
+              public static final Identifier FONT_ID = Identifier.of("mochi", "liquid");
+              public static boolean customFont = true;
+
+              private Gfx() {}
+
+              public static void begin(DrawContext c) { ctx = c; }
+
+              // ---- text (VERSION-SENSITIVE: Style.withFont signature changed in 1.21.9+) ----
+              private static Text text(String s) {
+                  if (TEXT_CACHE.size() > 2048) TEXT_CACHE.clear();
+                  return TEXT_CACHE.computeIfAbsent(s, k -> customFont
+                          ? Text.literal(k).setStyle(Style.EMPTY.withFont(FONT_ID))
+                          : Text.literal(k));
+              }
+              private static TextRenderer tr() { return MinecraftClient.getInstance().textRenderer; }
+              public static int textWidth(String s) { return tr().getWidth(text(s)); }
+              public static int textHeight() { return 9; }
+              public static void text(String s, int x, int y, int color) { ctx.drawText(tr(), text(s), x, y, color, false); }
+              public static void textCentered(String s, int cx, int y, int color) { text(s, cx - textWidth(s) / 2, y, color); }
+              public static String fit(String s, int maxW) {
+                  if (textWidth(s) <= maxW) return s;
+                  while (s.length() > 1 && textWidth(s + "..") > maxW) s = s.substring(0, s.length() - 1);
+                  return s + "..";
+              }
+              public static void scissor(int x, int y, int w, int h) { ctx.enableScissor(x, y, x + w, y + h); }
+              public static void unscissor() { ctx.disableScissor(); }
+
+              // ---- colour helpers (ARGB ints) ----
+              public static int rgba(int rgb, int a) { return (Math.max(0, Math.min(255, a)) << 24) | (rgb & 0xFFFFFF); }
+              public static int mulA(int argb, float f) {
+                  int a = (int) ((argb >>> 24) * Math.max(0f, Math.min(1f, f)));
+                  return (a << 24) | (argb & 0xFFFFFF);
+              }
+              public static int lerp(int c1, int c2, float t) {
+                  t = Math.max(0f, Math.min(1f, t));
+                  int a = (int) ((c1 >>> 24) + ((c2 >>> 24) - (c1 >>> 24)) * t);
+                  int r = (int) (((c1 >> 16) & 255) + (((c2 >> 16) & 255) - ((c1 >> 16) & 255)) * t);
+                  int g = (int) (((c1 >> 8) & 255) + (((c2 >> 8) & 255) - ((c1 >> 8) & 255)) * t);
+                  int b = (int) ((c1 & 255) + ((c2 & 255) - (c1 & 255)) * t);
+                  return (a << 24) | (r << 16) | (g << 8) | b;
+              }
+
+              // ---- primitives ----
+              public static void rect(int x, int y, int w, int h, int c) {
+                  if (w > 0 && h > 0 && (c >>> 24) > 0) ctx.fill(x, y, x + w, y + h, c);
+              }
+              private static int inset(int row, int h, int r) {
+                  if (r <= 0) return 0;
+                  double d;
+                  if (row < r) d = r - row - 0.5;
+                  else if (row >= h - r) d = row - (h - r) + 0.5;
+                  else return 0;
+                  return Math.max(0, (int) Math.ceil(r - Math.sqrt(Math.max(0, r * r - d * d)) - 0.3));
+              }
+              public static void roundRect(int x, int y, int w, int h, int r, int c) {
+                  if (w <= 0 || h <= 0 || (c >>> 24) == 0) return;
+                  r = Math.min(r, Math.min(w, h) / 2);
+                  for (int row = 0; row < Math.min(r, h); row++) rect(x + inset(row, h, r), y + row, w - 2 * inset(row, h, r), 1, c);
+                  rect(x, y + r, w, h - 2 * r, c);
+                  for (int row = h - r; row < h; row++) rect(x + inset(row, h, r), y + row, w - 2 * inset(row, h, r), 1, c);
+              }
+              /** Vertical gradient rounded rect. */
+              public static void roundRectV(int x, int y, int w, int h, int r, int top, int bottom) {
+                  if (w <= 0 || h <= 0) return;
+                  r = Math.min(r, Math.min(w, h) / 2);
+                  for (int row = 0; row < Math.min(r, h); row++) {
+                      int i = inset(row, h, r);
+                      rect(x + i, y + row, w - 2 * i, 1, lerp(top, bottom, row / (float) Math.max(1, h - 1)));
+                  }
+                  if (h - 2 * r > 0) {
+                      ctx.fillGradient(x, y + r, x + w, y + h - r,
+                              lerp(top, bottom, r / (float) Math.max(1, h - 1)),
+                              lerp(top, bottom, (h - r) / (float) Math.max(1, h - 1)));
+                  }
+                  for (int row = h - r; row < h; row++) {
+                      int i = inset(row, h, r);
+                      rect(x + i, y + row, w - 2 * i, 1, lerp(top, bottom, row / (float) Math.max(1, h - 1)));
+                  }
+              }
+              /** Horizontal gradient rounded rect (mixed colour). */
+              public static void roundRectH(int x, int y, int w, int h, int r, int left, int right) {
+                  if (w <= 0 || h <= 0) return;
+                  r = Math.min(r, Math.min(w, h) / 2);
+                  for (int col = 0; col < w; col += 2) {
+                      int cw = Math.min(2, w - col);
+                      int v = inset(col, w, r);
+                      rect(x + col, y + v, cw, h - 2 * v, lerp(left, right, col / (float) Math.max(1, w - 1)));
+                  }
+              }
+              public static void roundOutline(int x, int y, int w, int h, int r, int t, int c) {
+                  r = Math.min(r, Math.min(w, h) / 2);
+                  for (int row = 0; row < h; row++) {
+                      int o = inset(row, h, r);
+                      if (row < t || row >= h - t) { rect(x + o, y + row, w - 2 * o, 1, c); continue; }
+                      int in = Math.max(o, t + inset(row - t, h - 2 * t, Math.max(0, r - t)));
+                      rect(x + o, y + row, in - o, 1, c);
+                      rect(x + w - in, y + row, in - o, 1, c);
+                  }
+              }
+              public static void circle(int cx, int cy, int r, int c) {
+                  for (int dy = -r; dy <= r; dy++) {
+                      int half = (int) Math.round(Math.sqrt(Math.max(0, r * r - dy * dy + r * 0.4)));
+                      rect(cx - half, cy + dy, half * 2, 1, c);
+                  }
+              }
+              public static void circleV(int cx, int cy, int r, int top, int bottom) {
+                  for (int dy = -r; dy <= r; dy++) {
+                      int half = (int) Math.round(Math.sqrt(Math.max(0, r * r - dy * dy + r * 0.4)));
+                      rect(cx - half, cy + dy, half * 2, 1, lerp(top, bottom, (dy + r) / (float) (2 * r)));
+                  }
+              }
+              public static void ring(int cx, int cy, int r, int t, int c) {
+                  int ir = r - t;
+                  for (int dy = -r; dy <= r; dy++) {
+                      int oh = (int) Math.round(Math.sqrt(Math.max(0, r * r - dy * dy + r * 0.4)));
+                      if (Math.abs(dy) >= ir) { rect(cx - oh, cy + dy, oh * 2, 1, c); continue; }
+                      int ih = (int) Math.round(Math.sqrt(Math.max(0, ir * ir - dy * dy)));
+                      rect(cx - oh, cy + dy, oh - ih, 1, c);
+                      rect(cx + ih, cy + dy, oh - ih, 1, c);
+                  }
+              }
+              /** Soft glow made of stacked translucent discs (2px row step = cheap on phones). */
+              public static void glow(int cx, int cy, int r, int rgb, int alphaPerLayer, int layers) {
+                  for (int i = layers; i >= 1; i--) {
+                      int rr = (int) (r * i / (float) layers);
+                      int c = rgba(rgb, alphaPerLayer);
+                      for (int dy = -rr; dy <= rr; dy += 2) {
+                          int half = (int) Math.sqrt(Math.max(0, rr * rr - dy * dy));
+                          rect(cx - half, cy + dy, half * 2, 2, c);
+                      }
+                  }
+              }
+          }
+          EOF_4
+          cat > src/main/java/cc/mochi/liquid/KeyNames.java <<'EOF_5'
+          package cc.mochi.liquid;
+
+          import org.lwjgl.glfw.GLFW;
+
+          final class KeyNames {
+              private KeyNames() {}
+              static String of(int k) {
+                  if (k <= 0) return "None";
+                  switch (k) {
+                      case 32: return "Space";
+                      case 340: case 344: return "Shift";
+                      case 341: case 345: return "Ctrl";
+                      case 342: case 346: return "Alt";
+                      case 258: return "Tab";
+                      case 257: return "Enter";
+                      case 259: return "Back";
+                      case 262: return "Right";
+                      case 263: return "Left";
+                      case 264: return "Down";
+                      case 265: return "Up";
+                      default:
+                  }
+                  if (k >= 290 && k <= 301) return "F" + (k - 289);
+                  String n = GLFW.glfwGetKeyName(k, 0);
+                  return n != null ? n.toUpperCase() : "K" + k;
+              }
+          }
+          EOF_5
+          cat > src/main/java/cc/mochi/liquid/LiquidTheme.java <<'EOF_6'
+          package cc.mochi.liquid;
+
+          import java.awt.Color;
+
+          /** Theme presets with mixed (two-colour) gradients plus an editable custom pair. */
+          public final class LiquidTheme {
+              public record Preset(String name, int a, int b, boolean prism) {}
+
+              public static final Preset[] PRESETS = {
+                      new Preset("Aurora", 0x7C5CFF, 0x22D3EE, false),
+                      new Preset("Sunset", 0xFF7A59, 0xFF4FA3, false),
+                      new Preset("Ocean", 0x2DD4BF, 0x3B82F6, false),
+                      new Preset("Mint", 0x34D399, 0xA3E635, false),
+                      new Preset("Rose", 0xFB7185, 0xC084FC, false),
+                      new Preset("Ember", 0xF59E0B, 0xEF4444, false),
+                      new Preset("Prism", 0xFFFFFF, 0xFFFFFF, true),
+                      new Preset("Custom", 0x7C5CFF, 0x22D3EE, false),
+              };
+              public static final int CUSTOM = PRESETS.length - 1;
+
+              public static int index = 0;
+              public static float customHueA = 0.72f, customHueB = 0.52f;
+              public static float glassAlpha = 0.85f;
+              public static boolean motion = true;
+              public static float time;
+
+              private LiquidTheme() {}
+
+              public static Preset current() { return PRESETS[index]; }
+
+              public static int colorA(int i) { return i == CUSTOM ? hue(customHueA) : PRESETS[i].a(); }
+              public static int colorB(int i) { return i == CUSTOM ? hue(customHueB) : PRESETS[i].b(); }
+              public static int hue(float h) { return Color.HSBtoRGB(h, 0.62f, 1f) & 0xFFFFFF; }
+
+              /** Mixed colour at position t (0..1) for preset i. */
+              public static int mix(int i, float t) {
+                  if (PRESETS[i].prism()) return Color.HSBtoRGB((t * 0.45f + time * 0.06f) % 1f, 0.55f, 1f) & 0xFFFFFF;
+                  return Gfx.lerp(0xFF000000 | colorA(i), 0xFF000000 | colorB(i), t) & 0xFFFFFF;
+              }
+              public static int mix(float t) { return mix(index, t); }
+              public static int accent() { return mix(0.35f); }
+              public static int accent2() { return mix(0.9f); }
+          }
+          EOF_6
+          cat > src/main/java/cc/mochi/liquid/LiquidGuiScreen.java <<'EOF_7'
+          package cc.mochi.liquid;
+
+          import cc.mochi.*;
+          import cc.mochi.Module;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.Click;
+          import net.minecraft.client.input.CharInput;
+          import net.minecraft.client.input.KeyInput;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.util.*;
+          import java.util.function.IntConsumer;
+
+          /**
+           * Liquid-glass click GUI. Reads every module straight from ModuleManager (nothing in the
+           * modules is edited), groups them by ModuleCategory and renders touch-friendly cards.
+           */
+          public class LiquidGuiScreen extends Screen {
+              private static ModuleCategory lastCat = ModuleCategory.COMBAT;
+              private static String search = "";
+
+              private static final class Hit {
+                  int x, y, w, h, clipT, clipB; Runnable click; IntConsumer drag;
+              }
+
+              private final List<Hit> hits = new ArrayList<>();
+              private final Map<Module, Float> expandAnim = new HashMap<>();
+              private final Map<Module, Float> toggleAnim = new HashMap<>();
+              private final Set<Module> expanded = new HashSet<>();
+              private final Map<Object, Float> settingAnim = new HashMap<>();
+
+              private float openAnim, scroll, scrollTarget, contentH, viewH, catY = -1;
+              private long lastNs = System.nanoTime();
+              private boolean searchFocus, themePopup, dragged, pressInList;
+              private Hit pressHit, activeDrag;
+              private double pressY;
+              private Module listenModule;
+              private KeybindSetting listenSetting;
+              private int clipT = Integer.MIN_VALUE, clipB = Integer.MAX_VALUE;
+              private int px, py, pw, ph, listX, listY, listW, listH;
+              private int mx, my;
+
+              public LiquidGuiScreen() { super(Text.literal("Meow")); }
+
+              @Override public boolean shouldPause() { return false; }
+
+              // ------------------------------------------------------------------ render
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  long now = System.nanoTime();
+                  float dt = Math.min(0.05f, (now - lastNs) / 1e9f);
+                  lastNs = now;
+                  LiquidTheme.time += dt;
+                  openAnim = Math.min(1f, openAnim + dt * (LiquidTheme.motion ? 5f : 50f));
+                  float e = 1f - (1f - openAnim) * (1f - openAnim) * (1f - openAnim);
+                  mx = mouseX; my = mouseY;
+                  Gfx.begin(ctx);
+                  hits.clear();
+                  clipT = Integer.MIN_VALUE; clipB = Integer.MAX_VALUE;
+
+                  pw = Math.max(300, Math.min(520, (int) (width * 0.80f)));
+                  ph = Math.max(210, Math.min(340, (int) (height * 0.82f)));
+                  px = (width - pw) / 2;
+                  py = (height - ph) / 2 + (int) ((1f - e) * 16);
+
+                  // dim backdrop + cursor glow orbs
+                  Gfx.rect(0, 0, width, height, Gfx.rgba(0x04050A, (int) (150 * e)));
+                  if (LiquidTheme.motion) {
+                      Gfx.glow(mouseX, mouseY, 46, LiquidTheme.mix(0.2f), (int) (7 * e), 4);
+                      double t = LiquidTheme.time * 1.8;
+                      for (int i = 0; i < 3; i++) {
+                          int ox = (int) (Math.cos(t + i * 2.09) * 26), oy = (int) (Math.sin(t + i * 2.09) * 26);
+                          Gfx.glow(mouseX + ox, mouseY + oy, 12, LiquidTheme.mix(i / 2f), (int) (10 * e), 3);
+                      }
+                  }
+
+                  drawGlassPanel(px, py, pw, ph, 18, e);
+                  drawRail(e);
+                  drawHeader(e);
+                  drawList(e);
+                  if (themePopup) drawThemePopup(e);
+              }
+
+              private void drawGlassPanel(int x, int y, int w, int h, int r, float a) {
+                  int acc = LiquidTheme.accent();
+                  for (int i = 3; i >= 1; i--) Gfx.roundRect(x - i * 2, y - i * 2, w + i * 4, h + i * 4, r + i * 2, Gfx.rgba(acc, (int) (9 / (float) i * a)));
+                  float ga = LiquidTheme.glassAlpha;
+                  int top = Gfx.lerp(0xFF1D2138, 0xFF000000 | acc, 0.10f);
+                  Gfx.roundRectV(x, y, w, h, r, Gfx.mulA(top, a * ga), Gfx.mulA(0xFF090B14, a * ga));
+                  // liquid blobs
+                  Gfx.scissor(x + 4, y + 4, w - 8, h - 8);
+                  double t = LiquidTheme.time * (LiquidTheme.motion ? 1 : 0);
+                  for (int i = 0; i < 3; i++) {
+                      int bx = (int) (x + w * (0.5 + 0.38 * Math.sin(t * 0.55 + i * 2.1)));
+                      int by = (int) (y + h * (0.5 + 0.38 * Math.cos(t * 0.45 + i * 1.7)));
+                      Gfx.glow(bx, by, (int) (h * 0.46f), LiquidTheme.mix(i / 2f), (int) (6 * a), 4);
+                  }
+                  Gfx.unscissor();
+                  // glass sheen + rim
+                  Gfx.roundRectV(x + 2, y + 2, w - 4, h / 3, r - 2, Gfx.rgba(0xFFFFFF, (int) (34 * a)), Gfx.rgba(0xFFFFFF, 0));
+                  Gfx.roundOutline(x, y, w, h, r, 1, Gfx.rgba(0xFFFFFF, (int) (58 * a)));
+                  Gfx.roundOutline(x + 1, y + 1, w - 2, h - 2, r - 1, 1, Gfx.rgba(acc, (int) (26 * a)));
+              }
+
+              // ------------------------------------------------------------------ rail
+              private void drawRail(float a) {
+                  ModuleCategory[] cats = ModuleCategory.values();
+                  int railX = px + 10, d = 30;
+                  int step = Math.min(38, (ph - 36) / cats.length);
+                  int top = py + 18;
+                  Gfx.roundRect(railX - 4, py + 10, d + 8, step * cats.length + 12, (d + 8) / 2, Gfx.rgba(0xFFFFFF, (int) (14 * a)));
+                  int selIdx = Arrays.asList(cats).indexOf(lastCat);
+                  float targetY = top + selIdx * step;
+                  catY = catY < 0 ? targetY : catY + (targetY - catY) * 0.25f;
+                  int cx = railX + d / 2;
+                  Gfx.glow(cx, (int) catY + d / 2, 26, LiquidTheme.accent(), (int) (9 * a), 3);
+                  Gfx.circleV(cx, (int) catY + d / 2, d / 2, Gfx.mulA(0xFF000000 | LiquidTheme.mix(0.1f), a), Gfx.mulA(0xFF000000 | LiquidTheme.mix(0.9f), a));
+                  Gfx.ring(cx, (int) catY + d / 2, d / 2, 1, Gfx.rgba(0xFFFFFF, (int) (90 * a)));
+                  for (int i = 0; i < cats.length; i++) {
+                      final ModuleCategory c = cats[i];
+                      int cy = top + i * step + d / 2;
+                      boolean hover = Math.hypot(mx - cx, my - cy) < d / 2.0 + 3;
+                      if (hover && c != lastCat) Gfx.circle(cx, cy, d / 2, Gfx.rgba(0xFFFFFF, (int) (24 * a)));
+                      String n = c.getName();
+                      String ch = n.isEmpty() ? "?" : n.substring(0, 1).toUpperCase();
+                      Gfx.textCentered(ch, cx, cy - 4, Gfx.rgba(0xFFFFFF, (int) ((c == lastCat ? 255 : 170) * a)));
+                      addHit(cx - d / 2 - 3, cy - d / 2 - 3, d + 6, d + 6, () -> { lastCat = c; search = ""; scrollTarget = 0; scroll = 0; }, null);
+                  }
+              }
+
+              // ------------------------------------------------------------------ header
+              private void drawHeader(float a) {
+                  int x = px + 54, y = py + 12, w = pw - 54 - 14, h = 26;
+                  String title = search.isEmpty() ? lastCat.getName() : "Search";
+                  Gfx.text(title, x, y + 2, Gfx.rgba(0xFFFFFF, (int) (255 * a)));
+                  int count = visibleModules().size();
+                  Gfx.text(count + " modules", x, y + 14, Gfx.rgba(0xFFFFFF, (int) (110 * a)));
+
+                  // theme orb
+                  int orb = 11, ox = x + w - orb;
+                  int ocy = y + h / 2;
+                  Gfx.glow(ox, ocy, 18, LiquidTheme.accent(), (int) (10 * a), 3);
+                  Gfx.circleV(ox, ocy, orb, Gfx.mulA(0xFF000000 | LiquidTheme.mix(0f), a), Gfx.mulA(0xFF000000 | LiquidTheme.mix(1f), a));
+                  Gfx.ring(ox, ocy, orb, 1, Gfx.rgba(0xFFFFFF, (int) (110 * a)));
+                  addHit(ox - orb - 4, ocy - orb - 4, orb * 2 + 8, orb * 2 + 8, () -> themePopup = !themePopup, null);
+
+                  // search pill
+                  int sw = Math.min(130, w / 2), sx = ox - orb - 10 - sw;
+                  int sy = y + 2, sh = 22;
+                  Gfx.roundRect(sx, sy, sw, sh, sh / 2, Gfx.rgba(0xFFFFFF, (int) ((searchFocus ? 34 : 18) * a)));
+                  Gfx.roundOutline(sx, sy, sw, sh, sh / 2, 1, searchFocus ? Gfx.rgba(LiquidTheme.accent(), (int) (200 * a)) : Gfx.rgba(0xFFFFFF, (int) (40 * a)));
+                  boolean blink = searchFocus && ((int) (LiquidTheme.time * 2) % 2 == 0);
+                  String shown = search.isEmpty() && !searchFocus ? "Search..." : search + (blink ? "|" : "");
+                  int col = search.isEmpty() ? Gfx.rgba(0xFFFFFF, (int) (100 * a)) : Gfx.rgba(0xFFFFFF, (int) (240 * a));
+                  Gfx.text(Gfx.fit(shown, sw - 16), sx + 8, sy + 7, col);
+                  addHit(sx, sy, sw, sh, () -> searchFocus = true, null);
+              }
+
+              // ------------------------------------------------------------------ list
+              private List<Module> visibleModules() {
+                  ModuleManager mm = MochiClient.INSTANCE.getModuleManager();
+                  List<Module> out = new ArrayList<>();
+                  if (search.isEmpty()) {
+                      for (Object o : mm.getModulesByCategory(lastCat)) out.add((Module) o);
+                  } else {
+                      String q = search.toLowerCase(Locale.ROOT);
+                      for (Object o : mm.getModules()) {
+                          Module m = (Module) o;
+                          if (m.getName().toLowerCase(Locale.ROOT).contains(q)) out.add(m);
+                      }
+                  }
+                  return out;
+              }
+
+              private void drawList(float a) {
+                  listX = px + 54; listY = py + 46; listW = pw - 54 - 14; listH = ph - 46 - 14;
+                  viewH = listH;
+                  float max = Math.max(0, contentH - viewH);
+                  scrollTarget = Math.max(0, Math.min(max, scrollTarget));
+                  scroll += (scrollTarget - scroll) * 0.3f;
+                  Gfx.scissor(listX - 2, listY, listW + 4, listH);
+                  clipT = listY; clipB = listY + listH;
+                  int y = listY - Math.round(scroll);
+                  int startY = y;
+                  List<Module> mods = visibleModules();
+                  if (mods.isEmpty()) Gfx.textCentered("No modules found", listX + listW / 2, listY + 20, Gfx.rgba(0xFFFFFF, (int) (120 * a)));
+                  for (Module m : mods) y += drawCard(m, listX, y, listW, a) + 6;
+                  contentH = y - startY;
+                  Gfx.unscissor();
+                  clipT = Integer.MIN_VALUE; clipB = Integer.MAX_VALUE;
+                  // fade edges + scrollbar
+                  if (contentH > viewH) {
+                      int bh = Math.max(18, (int) (viewH * viewH / contentH));
+                      int by = listY + (int) ((viewH - bh) * (scroll / Math.max(1f, contentH - viewH)));
+                      Gfx.roundRect(px + pw - 8, by, 3, bh, 2, Gfx.rgba(LiquidTheme.accent(), (int) (150 * a)));
+                  }
+              }
+
+              private List<Setting> visibleSettings(Module m) {
+                  List<Setting> out = new ArrayList<>();
+                  for (Object o : m.getSettings()) {
+                      Setting s = (Setting) o;
+                      if (s.isVisible() && s != m.getKeybind()) out.add(s);
+                  }
+                  return out;
+              }
+
+              private int settingH(Setting s) {
+                  if (s instanceof DoubleSetting || s instanceof DecimalSetting) return 28;
+                  if (s instanceof ColorSetting) return 42;
+                  return 22;
+              }
+
+              private int drawCard(Module m, int x, int y, int w, float a) {
+                  boolean on = m.isEnabled();
+                  float t = approach(toggleAnim, m, on ? 1f : 0f, 0.22f);
+                  List<Setting> settings = visibleSettings(m);
+                  int fullSettingsH = 0;
+                  for (Setting s : settings) fullSettingsH += settingH(s);
+                  boolean isExp = expanded.contains(m) && !settings.isEmpty();
+                  float ex = approach(expandAnim, m, isExp ? 1f : 0f, 0.25f);
+                  int head = 36;
+                  int h = head + (int) (fullSettingsH * ex) + (ex > 0.01f ? 6 : 0);
+
+                  boolean inView = y + h > clipT && y < clipB;
+                  if (!inView) return h;
+
+                  boolean hover = mx >= x && mx < x + w && my >= Math.max(y, clipT) && my < Math.min(y + head, clipB);
+                  int acc = LiquidTheme.accent();
+                  // card glass
+                  Gfx.roundRect(x, y, w, h, 11, Gfx.rgba(0xFFFFFF, (int) ((hover ? 26 : 16) * a)));
+                  if (t > 0.01f) {
+                      Gfx.roundRectH(x, y, w, h, 11, Gfx.rgba(LiquidTheme.mix(0f), (int) (46 * t * a)), Gfx.rgba(LiquidTheme.mix(1f), (int) (22 * t * a)));
+                  }
+                  Gfx.roundRectV(x + 1, y + 1, w - 2, Math.min(h / 2, 14), 10, Gfx.rgba(0xFFFFFF, (int) (22 * a)), Gfx.rgba(0xFFFFFF, 0));
+                  Gfx.roundOutline(x, y, w, h, 11, 1, Gfx.lerp(Gfx.rgba(0xFFFFFF, (int) (34 * a)), Gfx.rgba(acc, (int) (150 * a)), t));
+
+                  // text
+                  int pillW = 30, pillH = 16;
+                  int pillX = x + w - pillW - 10, pillY = y + (head - pillH) / 2;
+                  String key = KeyNames.of(m.getKeyCode());
+                  boolean listening = listenModule == m;
+                  String chipText = listening ? "..." : key;
+                  int chipW = Math.max(30, Gfx.textWidth(chipText) + 14);
+                  int chipX = pillX - chipW - 8;
+                  int textMaxW = chipX - (x + 12) - 8;
+                  Gfx.text(Gfx.fit(m.getName(), textMaxW), x + 12, y + 7, Gfx.lerp(Gfx.rgba(0xFFFFFF, (int) (215 * a)), Gfx.rgba(0xFFFFFF, (int) (255 * a)), t));
+                  String desc = m.getDescription();
+                  if (desc != null && !desc.isEmpty()) Gfx.text(Gfx.fit(desc, textMaxW), x + 12, y + 20, Gfx.rgba(0xFFFFFF, (int) (100 * a)));
+
+                  // keybind chip
+                  Gfx.roundRect(chipX, pillY, chipW, pillH, pillH / 2, Gfx.rgba(listening ? acc : 0xFFFFFF, (int) ((listening ? 70 : 22) * a)));
+                  Gfx.textCentered(Gfx.fit(chipText, chipW - 6), chipX + chipW / 2, pillY + 4, Gfx.rgba(0xFFFFFF, (int) (200 * a)));
+                  addHit(chipX, pillY - 4, chipW, pillH + 8, () -> { listenModule = m; listenSetting = null; }, null);
+
+                  // toggle pill
+                  drawPill(pillX, pillY, pillW, pillH, t, a);
+                  addHit(pillX - 4, pillY - 6, pillW + 8, pillH + 12, m::toggle, null);
+
+                  // expand: tap anywhere else on the head
+                  if (!settings.isEmpty()) {
+                      addHit(x, y, chipX - x - 4, head, () -> { if (!expanded.remove(m)) expanded.add(m); }, null);
+                  } else {
+                      addHit(x, y, chipX - x - 4, head, m::toggle, null);
+                  }
+
+                  // settings
+                  if (ex > 0.01f) {
+                      Gfx.scissor(x, y + head, w, h - head);
+                      int sy = y + head;
+                      float sa = a * ex;
+                      for (Setting s : settings) { drawSetting(s, x + 12, sy, w - 24, sa); sy += settingH(s); }
+                      Gfx.unscissor();
+                  }
+                  return h;
+              }
+
+              private void drawPill(int x, int y, int w, int h, float t, float a) {
+                  Gfx.roundRect(x, y, w, h, h / 2, Gfx.rgba(0xFFFFFF, (int) (30 * a)));
+                  if (t > 0.01f) Gfx.roundRectH(x, y, w, h, h / 2, Gfx.rgba(LiquidTheme.mix(0f), (int) (255 * t * a)), Gfx.rgba(LiquidTheme.mix(1f), (int) (255 * t * a)));
+                  int kx = x + h / 2 + (int) ((w - h) * t);
+                  Gfx.glow(kx, y + h / 2, h, 0xFFFFFF, (int) (6 * t * a), 2);
+                  Gfx.circle(kx, y + h / 2, h / 2 - 2, Gfx.rgba(0xFFFFFF, (int) (245 * a)));
+              }
+
+              // ------------------------------------------------------------------ settings widgets
+              private void drawSetting(Setting s, int x, int y, int w, float a) {
+                  int white = Gfx.rgba(0xFFFFFF, (int) (210 * a));
+                  int dim = Gfx.rgba(0xFFFFFF, (int) (120 * a));
+                  int acc = LiquidTheme.accent();
+                  if (s instanceof BooleanSetting b) {
+                      Gfx.text(Gfx.fit(b.getName(), w - 44), x, y + 7, white);
+                      float t = approach(settingAnim, b, b.getValue() ? 1f : 0f, 0.25f);
+                      drawPill(x + w - 28, y + 3, 28, 15, t, a);
+                      addHit(x, y, w, 22, b::toggle, null);
+                  } else if (s instanceof DoubleSetting d) {
+                      String val = (d.getStep() >= 1 ? String.valueOf((int) d.getValue()) : String.format(Locale.ROOT, "%.2f", d.getValue()));
+                      Gfx.text(Gfx.fit(d.getName(), w - 50), x, y + 3, white);
+                      Gfx.text(val, x + w - Gfx.textWidth(val), y + 3, dim);
+                      slider(x, y + 17, w, (float) ((d.getValue() - d.getMinimum()) / (d.getMaximum() - d.getMinimum())), a,
+                              px2 -> { double f = Math.max(0, Math.min(1, (px2 - x) / (double) w)); double v = d.getMinimum() + f * (d.getMaximum() - d.getMinimum());
+                                  if (d.getStep() > 0) v = Math.round(v / d.getStep()) * d.getStep(); d.setValue(Math.max(d.getMinimum(), Math.min(d.getMaximum(), v))); });
+                  } else if (s instanceof DecimalSetting d) {
+                      Gfx.text(Gfx.fit(d.getName(), w - 50), x, y + 3, white);
+                      String val = d.formatValue();
+                      Gfx.text(val, x + w - Gfx.textWidth(val), y + 3, dim);
+                      slider(x, y + 17, w, (float) ((d.getValue() - d.getMinimum()) / (d.getMaximum() - d.getMinimum())), a,
+                              px2 -> { double f = Math.max(0, Math.min(1, (px2 - x) / (double) w)); d.setValue(d.getMinimum() + f * (d.getMaximum() - d.getMinimum())); });
+                  } else if (s instanceof ChoiceSetting c) {
+                      Gfx.text(Gfx.fit(c.getName(), w / 2 - 4), x, y + 7, white);
+                      String v = Gfx.fit(c.getSelected(), w / 2 - 12);
+                      int cw = Gfx.textWidth(v) + 16;
+                      Gfx.roundRect(x + w - cw, y + 3, cw, 16, 8, Gfx.rgba(acc, (int) (46 * a)));
+                      Gfx.textCentered(v, x + w - cw / 2, y + 7, Gfx.rgba(0xFFFFFF, (int) (235 * a)));
+                      addHit(x + w / 2 - 10, y, w / 2 + 10, 22, c::cycle, null);
+                  } else if (s instanceof ColorSetting c) {
+                      Gfx.text(Gfx.fit(c.getName(), w - 30), x, y + 3, white);
+                      Gfx.circle(x + w - 7, y + 7, 6, 0xFF000000 | c.getRgb());
+                      Gfx.ring(x + w - 7, y + 7, 6, 1, Gfx.rgba(0xFFFFFF, (int) (150 * a)));
+                      float[] hsb = c.getHsb();
+                      int bw = w;
+                      // hue strip
+                      for (int i = 0; i < bw; i += 3) Gfx.rect(x + i, y + 17, Math.min(3, bw - i), 8, Gfx.mulA(0xFF000000 | LiquidTheme.hue(i / (float) bw), a));
+                      Gfx.circle(x + (int) (hsb[0] * bw), y + 21, 5, Gfx.rgba(0xFFFFFF, (int) (240 * a)));
+                      addHit(x, y + 14, w, 14, null, px2 -> { float[] c2 = c.getHsb(); c.setHsb(Math.max(0f, Math.min(1f, (px2 - x) / (float) bw)), Math.max(0.55f, c2[1]), Math.max(0.6f, c2[2])); });
+                      // brightness strip
+                      int base = 0xFF000000 | java.awt.Color.HSBtoRGB(hsb[0], hsb[1], 1f);
+                      Gfx.roundRectH(x, y + 30, bw, 8, 4, Gfx.mulA(0xFF000000, a), Gfx.mulA(base, a));
+                      Gfx.circle(x + (int) (hsb[2] * bw), y + 34, 5, Gfx.rgba(0xFFFFFF, (int) (240 * a)));
+                      addHit(x, y + 27, w, 14, null, px2 -> { float[] c2 = c.getHsb(); c.setHsb(c2[0], c2[1], Math.max(0.05f, Math.min(1f, (px2 - x) / (float) bw))); });
+                  } else if (s instanceof KeybindSetting k) {
+                      Gfx.text(Gfx.fit(k.getName(), w - 60), x, y + 7, white);
+                      boolean l = listenSetting == k;
+                      String v = l ? "..." : KeyNames.of(k.getKeyCode());
+                      int cw = Math.max(34, Gfx.textWidth(v) + 14);
+                      Gfx.roundRect(x + w - cw, y + 3, cw, 16, 8, Gfx.rgba(l ? acc : 0xFFFFFF, (int) ((l ? 70 : 24) * a)));
+                      Gfx.textCentered(v, x + w - cw / 2, y + 7, Gfx.rgba(0xFFFFFF, (int) (220 * a)));
+                      addHit(x + w - cw - 4, y, cw + 4, 22, () -> { listenSetting = k; listenModule = null; }, null);
+                  } else if (s instanceof StringSetting st) {
+                      Gfx.text(Gfx.fit(st.getName(), w / 2), x, y + 7, white);
+                      String v = Gfx.fit(st.getValue3(), w / 2 - 6);
+                      Gfx.text(v, x + w - Gfx.textWidth(v), y + 7, dim);
+                  } else {
+                      Gfx.text(Gfx.fit(s.getName(), w), x, y + 7, white);
+                  }
+              }
+
+              private void slider(int x, int y, int w, float f, float a, IntConsumer drag) {
+                  f = Math.max(0f, Math.min(1f, f));
+                  Gfx.roundRect(x, y + 2, w, 5, 2, Gfx.rgba(0xFFFFFF, (int) (30 * a)));
+                  int fw = Math.max(4, (int) (w * f));
+                  Gfx.roundRectH(x, y + 2, fw, 5, 2, Gfx.rgba(LiquidTheme.mix(0f), (int) (255 * a)), Gfx.rgba(LiquidTheme.mix(f), (int) (255 * a)));
+                  Gfx.glow(x + fw, y + 4, 9, LiquidTheme.mix(f), (int) (14 * a), 3);
+                  Gfx.circle(x + fw, y + 4, 4, Gfx.rgba(0xFFFFFF, (int) (250 * a)));
+                  addHit(x - 4, y - 6, w + 8, 20, null, drag);
+              }
+
+              // ------------------------------------------------------------------ theme popup
+              private void drawThemePopup(float a) {
+                  int w = 214, h = 118;
+                  int x = px + pw - w - 10, y = py + 42;
+                  for (int i = 2; i >= 1; i--) Gfx.roundRect(x - i * 2, y - i * 2, w + i * 4, h + i * 4, 14 + i, Gfx.rgba(LiquidTheme.accent(), 8));
+                  Gfx.roundRectV(x, y, w, h, 14, Gfx.rgba(0x1E2236, 238), Gfx.rgba(0x0A0C16, 245));
+                  Gfx.roundOutline(x, y, w, h, 14, 1, Gfx.rgba(0xFFFFFF, 60));
+                  addHit(x, y, w, h, () -> {}, null);
+                  Gfx.text("Theme  -  " + LiquidTheme.current().name(), x + 10, y + 8, 0xFFFFFFFF);
+                  int n = LiquidTheme.PRESETS.length;
+                  for (int i = 0; i < n; i++) {
+                      final int idx = i;
+                      int cx = x + 18 + i * 25, cy = y + 34;
+                      Gfx.circleV(cx, cy, 9, 0xFF000000 | LiquidTheme.mix(i, 0f), 0xFF000000 | LiquidTheme.mix(i, 1f));
+                      if (i == LiquidTheme.index) Gfx.ring(cx, cy, 12, 2, 0xFFFFFFFF);
+                      addHit(cx - 11, cy - 11, 22, 22, () -> LiquidTheme.index = idx, null);
+                  }
+                  // custom colour A/B
+                  for (int k = 0; k < 2; k++) {
+                      final int which = k;
+                      int sy = y + 54 + k * 18;
+                      Gfx.text(k == 0 ? "A" : "B", x + 10, sy + 1, 0xCCFFFFFF);
+                      int sx = x + 26, sw = w - 38;
+                      for (int i = 0; i < sw; i += 3) Gfx.rect(sx + i, sy, Math.min(3, sw - i), 8, 0xFF000000 | LiquidTheme.hue(i / (float) sw));
+                      float hv = k == 0 ? LiquidTheme.customHueA : LiquidTheme.customHueB;
+                      Gfx.circle(sx + (int) (hv * sw), sy + 4, 5, 0xFFFFFFFF);
+                      addHit(sx - 4, sy - 5, sw + 8, 18, null, px2 -> {
+                          float v = Math.max(0f, Math.min(1f, (px2 - sx) / (float) sw));
+                          if (which == 0) LiquidTheme.customHueA = v; else LiquidTheme.customHueB = v;
+                          LiquidTheme.index = LiquidTheme.CUSTOM;
+                      });
+                  }
+                  // glass opacity
+                  int sy = y + 92;
+                  Gfx.text("Glass", x + 10, sy, 0xCCFFFFFF);
+                  int sx = x + 50, sw = w - 100;
+                  float f = (LiquidTheme.glassAlpha - 0.4f) / 0.6f;
+                  Gfx.roundRect(sx, sy + 2, sw, 5, 2, 0x33FFFFFF);
+                  Gfx.roundRectH(sx, sy + 2, Math.max(4, (int) (sw * f)), 5, 2, 0xFF000000 | LiquidTheme.mix(0f), 0xFF000000 | LiquidTheme.mix(f));
+                  Gfx.circle(sx + (int) (sw * f), sy + 4, 4, 0xFFFFFFFF);
+                  addHit(sx - 4, sy - 5, sw + 8, 18, null, px2 -> LiquidTheme.glassAlpha = 0.4f + 0.6f * Math.max(0f, Math.min(1f, (px2 - sx) / (float) sw)));
+                  // motion toggle
+                  float mt = approach(settingAnim, "motion", LiquidTheme.motion ? 1f : 0f, 0.25f);
+                  drawPill(x + w - 40, sy - 1, 28, 15, mt, 1f);
+                  addHit(x + w - 44, sy - 5, 36, 24, () -> LiquidTheme.motion = !LiquidTheme.motion, null);
+              }
+
+              // ------------------------------------------------------------------ input
+              private void addHit(int x, int y, int w, int h, Runnable click, IntConsumer drag) {
+                  Hit hit = new Hit();
+                  hit.x = x; hit.y = y; hit.w = w; hit.h = h; hit.click = click; hit.drag = drag; hit.clipT = clipT; hit.clipB = clipB;
+                  hits.add(hit);
+              }
+
+              private Hit hitAt(double mx, double my) {
+                  for (int i = hits.size() - 1; i >= 0; i--) {
+                      Hit h = hits.get(i);
+                      if (mx >= h.x && mx < h.x + h.w && my >= Math.max(h.y, h.clipT) && my < Math.min(h.y + h.h, h.clipB)) return h;
+                  }
+                  return null;
+              }
+
+              @Override
+              public boolean mouseClicked(Click click, boolean doubled) {
+                  double x = click.x(), y = click.y();
+                  searchFocus = false;
+                  dragged = false; activeDrag = null; pressHit = null;
+                  pressY = y;
+                  pressInList = x >= listX && x < listX + listW && y >= listY && y < listY + listH;
+                  Hit h = hitAt(x, y);
+                  if (themePopup && h != null && h.click != null && h.drag == null && !isInsideThemePopup(x, y)) themePopup = false;
+                  else if (themePopup && h == null) themePopup = false;
+                  if (h == null) {
+                      if (x < px || x > px + pw || y < py || y > py + ph) close();
+                      return true;
+                  }
+                  if (h.drag != null) { activeDrag = h; h.drag.accept((int) x); }
+                  else pressHit = h;
+                  return true;
+              }
+
+              private boolean isInsideThemePopup(double x, double y) {
+                  int w = 214, h = 118, tx = px + pw - w - 10, ty = py + 42;
+                  return x >= tx && x < tx + w && y >= ty && y < ty + h;
+              }
+
+              @Override
+              public boolean mouseDragged(Click click, double dx, double dy) {
+                  if (activeDrag != null) { activeDrag.drag.accept((int) click.x()); return true; }
+                  if (pressInList && (dragged || Math.abs(click.y() - pressY) > 5)) { dragged = true; scrollTarget -= (float) dy; }
+                  return true;
+              }
+
+              @Override
+              public boolean mouseReleased(Click click) {
+                  if (pressHit != null && !dragged && pressHit.click != null) pressHit.click.run();
+                  pressHit = null; activeDrag = null; dragged = false;
+                  return true;
+              }
+
+              @Override
+              public boolean mouseScrolled(double x, double y, double horizontal, double vertical) {
+                  scrollTarget -= (float) (vertical * 28);
+                  return true;
+              }
+
+              @Override
+              public boolean keyPressed(KeyInput input) {
+                  int key = input.key();
+                  if (listenModule != null || listenSetting != null) {
+                      int val = (key == GLFW.GLFW_KEY_BACKSPACE || key == GLFW.GLFW_KEY_DELETE) ? -1 : key;
+                      if (key != GLFW.GLFW_KEY_ESCAPE) {
+                          if (listenModule != null) {
+                              listenModule.setKeyCode(val);
+                              if (listenModule.getKeybind() != null) listenModule.getKeybind().setKeyCode(val);
+                          } else listenSetting.setKeyCode(val);
+                      }
+                      listenModule = null; listenSetting = null;
+                      return true;
+                  }
+                  if (searchFocus) {
+                      if (key == GLFW.GLFW_KEY_ESCAPE || key == GLFW.GLFW_KEY_ENTER) { searchFocus = false; return true; }
+                      if (key == GLFW.GLFW_KEY_BACKSPACE && !search.isEmpty()) { search = search.substring(0, search.length() - 1); scrollTarget = 0; }
+                      return true;
+                  }
+                  if (key == GLFW.GLFW_KEY_ESCAPE || key == GLFW.GLFW_KEY_RIGHT_SHIFT) { close(); return true; }
+                  return super.keyPressed(input);
+              }
+
+              @Override
+              public boolean charTyped(CharInput input) {
+                  if (searchFocus && search.length() < 24) { search += input.asString(); scrollTarget = 0; return true; }
+                  return false;
+              }
+
+              // ------------------------------------------------------------------ util
+              private static <K> float approach(Map<K, Float> map, K key, float target, float speed) {
+                  float v = map.getOrDefault(key, target);
+                  v += (target - v) * speed;
+                  if (Math.abs(target - v) < 0.004f) v = target;
+                  map.put(key, v);
+                  return v;
+              }
+          }
+          EOF_7
+          cat > src/main/resources/assets/mochi/font/liquid.json <<'EOF_8'
+          {"providers":[{"type":"ttf","file":"mochi:Inter.ttf","shift":[0,0],"size":11.0,"oversample":4.0}]}
+          EOF_8
+
+      - name: Build jar
+        run: gradle meowJar --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-client-jar
+          path: build/libs/meow-client-liquid.jar
