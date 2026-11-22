@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Unzip project
+        run: |
+          Z=""
+          while IFS= read -r f; do
+            if unzip -Z1 "$f" 2>/dev/null | grep -qx 'build.gradle'; then Z="$f"; break; fi
+          done < <(find . -name '*.zip' -not -path './.git/*')
+          if [ -z "$Z" ]; then
+            echo "NO PROJECT ZIP FOUND. Upload meow-liquid-all.zip to the repo root."
+            find . -not -path './.git/*' -type f | head -50
+            exit 1
+          fi
+          echo "Using $Z"
+          mkdir -p proj
+          unzip -o -q "$Z" -d proj
+          ls -la proj proj/libs
+
+      - name: Build jar
+        working-directory: proj
+        run: gradle meowJar --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meow-client-jar
+          path: proj/build/libs/meow-client-liquid.jar
