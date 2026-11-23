@@ -1,0 +1,102 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to publish the release on tags
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Handles Gradle + Loom/Yarn/Minecraft caches between runs
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.2.0'
+
+      # Finds the folder that holds settings.gradle, so it works even if the
+      # files were uploaded inside a subfolder.
+      - name: Locate project
+        shell: bash
+        run: |
+          find_proj() { find . -name settings.gradle -not -path '*/.git/*' -not -path '*/build/*' | head -1; }
+          f=$(find_proj)
+          if [ -z "$f" ]; then
+            # Not extracted? Unzip any zip uploaded to the repo and look again.
+            for z in $(find . -maxdepth 2 -name '*.zip' -not -path '*/.git/*'); do
+              echo "Extracting $z"
+              mkdir -p _unzipped && unzip -q -o "$z" -d _unzipped
+            done
+            f=$(find_proj)
+          fi
+          if [ -z "$f" ]; then
+            echo "::error::No settings.gradle anywhere in the repo. Upload the files from inside the zip's src folder."
+            find . -maxdepth 3 -not -path './.git/*' | head -50
+            exit 1
+          fi
+          d=$(dirname "$f")
+          echo "Project dir: $d"
+          echo "PROJECT_DIR=$d" >> "$GITHUB_ENV"
+          test -f "$d/libs/meow-original.jar" || { echo "::error::libs/meow-original.jar is missing next to settings.gradle"; exit 1; }
+
+      - name: Build jar
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          gradle meowJar --no-daemon --console=plain 2>&1 | tee build.log
+
+      # Puts the real error (not the stack trace) on the run's Summary page
+      - name: Show error summary
+        if: failure()
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          {
+            echo '## Build error'
+            echo '```'
+            grep -n -B2 -A12 'What went wrong' build.log | head -60 || tail -40 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check jar
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          ls -lh build/libs/meow-client-aurora.jar
+          unzip -l build/libs/meow-client-aurora.jar | grep -q 'cc/mochi/MeowMenu.class'
+          unzip -l build/libs/meow-client-aurora.jar | grep -q 'cc/mochi/aurora/AuroraGuiScreen.class'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meow-client-jar
+          path: ${{ env.PROJECT_DIR }}/build/libs/meow-client-aurora.jar
+          if-no-files-found: error
+
+      # Tag a version (git tag v1 && git push --tags) to get a direct-download release
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            "${{ env.PROJECT_DIR }}/build/libs/meow-client-aurora.jar" \
+            --title "Meow Client + Aurora ${{ github.ref_name }}" \
+            --generate-notes
