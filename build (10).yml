@@ -1,0 +1,256 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Cancel older runs of the same branch so you never wait on a stale build
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+  GRADLE_VERSION: '9.2.0'
+  # No daemon on CI, long network timeouts, repo retries for flaky Maven/Fabric downloads
+  GRADLE_OPTS: >-
+    -Dorg.gradle.daemon=false
+    -Dorg.gradle.internal.http.connectionTimeout=120000
+    -Dorg.gradle.internal.http.socketTimeout=120000
+    -Dorg.gradle.internal.repository.max.retries=6
+    -Dorg.gradle.internal.repository.initial.backoff=1000
+    -Dorg.gradle.console=plain
+
+jobs:
+  build:
+    name: Build meow-client-vue.jar
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          lfs: true
+
+      # ---------- Find the project (works even if you uploaded it inside a subfolder) ----------
+      - name: Locate project
+        id: loc
+        shell: bash
+        run: |
+          set -euo pipefail
+          find_settings() { find . -maxdepth 4 -name settings.gradle -not -path './.git/*' -not -path '*/node_modules/*' | head -n1 || true; }
+          settings=$(find_settings)
+          # No loose project files? If you uploaded the project as a .zip, unpack it here.
+          if [ -z "$settings" ]; then
+            zipfile=$(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*' | head -n1 || true)
+            if [ -n "$zipfile" ]; then
+              echo "No loose project files, unpacking $zipfile"
+              mkdir -p _project
+              unzip -q -o "$zipfile" -d _project
+              settings=$(find_settings)
+            fi
+          fi
+          if [ -z "$settings" ]; then
+            echo "::error::No settings.gradle found anywhere in this repo. The project files were not uploaded (only the workflow is here?)."
+            echo "Repo contents:"; find . -maxdepth 3 -not -path './.git/*' | sort | head -100
+            echo "Fix: upload meow-vue-v3.zip itself to the repo root (the workflow unpacks it), or upload all the project files."
+            exit 1
+          fi
+          dir=$(dirname "$settings")
+          echo "Project directory: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      # ---------- Preflight: fail fast with a clear message ----------
+      - name: Preflight - required files
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in build.gradle settings.gradle gradle.properties \
+                   libs/meow-original.jar \
+                   src/main/java/cc/mochi/MeowMenu.java \
+                   src/main/java/cc/mochi/meowgui/MeowGuiScreen.java \
+                   src/main/java/cc/mochi/meowgui/Gfx.java \
+                   src/main/java/cc/mochi/meowgui/KeyNames.java \
+                   src/main/java/cc/mochi/MeowWebGuard.java; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::Missing required file: $f (did you upload libs/ and src/ to the repo?)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          size=$(stat -c%s libs/meow-original.jar)
+          echo "meow-original.jar size: $size bytes"
+          if [ "$size" -lt 10000 ]; then
+            echo "::error file=libs/meow-original.jar::Jar is only $size bytes - looks like a Git LFS pointer or a bad upload."
+            exit 1
+          fi
+          unzip -tq libs/meow-original.jar >/dev/null \
+            || { echo "::error file=libs/meow-original.jar::Jar is corrupt / not a valid zip"; exit 1; }
+
+      - name: Preflight - read versions
+        id: ver
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          get() { grep -E "^$1=" gradle.properties | head -n1 | cut -d= -f2- | tr -d '[:space:]'; }
+          echo "mc=$(get minecraft_version)"   >> "$GITHUB_OUTPUT"
+          echo "yarn=$(get yarn_mappings)"     >> "$GITHUB_OUTPUT"
+          echo "loader=$(get loader_version)"  >> "$GITHUB_OUTPUT"
+
+      # Checks the yarn build really exists on Fabric meta. If meta is down we only warn,
+      # if meta answers and the build is not there we fail with the fix.
+      - name: Preflight - verify Yarn mappings exist
+        shell: bash
+        env:
+          MC: ${{ steps.ver.outputs.mc }}
+          YARN: ${{ steps.ver.outputs.yarn }}
+        run: |
+          set -uo pipefail
+          for i in 1 2 3; do
+            if body=$(curl -fsSL --max-time 30 "https://meta.fabricmc.net/v2/versions/yarn/${MC}"); then
+              if echo "$body" | grep -q "\"version\": *\"${YARN}\""; then
+                echo "Yarn ${YARN} found for Minecraft ${MC}."
+                exit 0
+              fi
+              latest=$(echo "$body" | grep -o '"version": *"[^"]*"' | head -n1 | cut -d'"' -f4)
+              echo "::error file=gradle.properties::yarn_mappings=${YARN} does not exist for ${MC}. Latest is: ${latest:-unknown}. Update yarn_mappings in gradle.properties."
+              exit 1
+            fi
+            echo "Fabric meta unreachable (attempt $i/3), retrying..."
+            sleep $((i * 5))
+          done
+          echo "::warning::Could not reach meta.fabricmc.net, skipping the Yarn check."
+          exit 0
+
+      # ---------- Toolchain ----------
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          build-root-directory: ${{ steps.loc.outputs.dir }}
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Show environment
+        run: |
+          java -version
+          gradle --version
+
+      # ---------- Build (3 attempts so flaky downloads do not fail the run) ----------
+      - name: Build jar
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            echo "::group::Build attempt $attempt/3"
+            if gradle meowJar --no-daemon --stacktrace --warning-mode=summary; then
+              echo "::endgroup::"
+              echo "Build succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::Build attempt $attempt failed."
+            [ "$attempt" -lt 3 ] && { echo "Retrying in $((attempt * 15))s..."; sleep $((attempt * 15)); }
+          done
+          echo "::error::Build failed after 3 attempts. Check the log above (common causes: Loom version, Yarn build)."
+          exit 1
+
+      # ---------- Verify the output actually works ----------
+      - name: Verify jar
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          jar=build/libs/meow-client-vue.jar
+          [ -f "$jar" ] || { echo "::error::$jar was not produced"; ls -la build/libs || true; exit 1; }
+
+          unzip -tq "$jar" >/dev/null || { echo "::error::Output jar is corrupt"; exit 1; }
+          echo "Output size: $(stat -c%s "$jar") bytes"
+
+          listing=$(unzip -Z1 "$jar")
+          for c in cc/mochi/MeowMenu.class \
+                   cc/mochi/meowgui/MeowGuiScreen.class \
+                   cc/mochi/meowgui/Gfx.class \
+                   cc/mochi/meowgui/KeyNames.class \
+                   cc/mochi/meowgui/ThemeBridge.class \
+                   cc/mochi/FriendManager.class \
+                   cc/mochi/MeowWebGuard.class; do
+            echo "$listing" | grep -qx "$c" || { echo "::error::Missing $c in output jar"; exit 1; }
+          done
+
+          # The original jar's other classes must still be there (we only swap MeowMenu)
+          orig_count=$(unzip -Z1 libs/meow-original.jar | grep -c '\.class$' || true)
+          out_count=$(echo "$listing" | grep -c '\.class$' || true)
+          echo "Classes: original=$orig_count output=$out_count"
+          [ "$out_count" -ge "$orig_count" ] \
+            || { echo "::error::Output has fewer classes than the original jar"; exit 1; }
+
+          # The patched Auto Mace must call the cobweb guard
+          unzip -p "$jar" cc/mochi/AutoMaceModule.class | grep -aq 'MeowWebGuard' \
+            || { echo "::error::AutoMaceModule is not patched (no MeowWebGuard reference)"; exit 1; }
+
+          # Signature files would make the JVM reject the modified jar
+          if echo "$listing" | grep -Eq '^META-INF/.*\.(SF|RSA|DSA)$'; then
+            echo "::error::Stale signature files found in output jar"; exit 1
+          fi
+          echo "Jar verified OK."
+
+      # ---------- Outputs ----------
+      - name: Upload jar
+        uses: actions/upload-artifact@v5
+        with:
+          name: meow-client-jar
+          path: ${{ steps.loc.outputs.dir }}/build/libs/meow-client-vue.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-reports
+          path: |
+            ${{ steps.loc.outputs.dir }}/build/reports/**
+            ${{ steps.loc.outputs.dir }}/build/tmp/**/*.log
+            hs_err_pid*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Push a tag like v1.0 and the jar is attached to a GitHub Release automatically
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: meow-client-jar
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/meow-client-vue.jar
+          generate_release_notes: true
+          fail_on_unmatched_files: true
