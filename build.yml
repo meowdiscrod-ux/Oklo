@@ -1,0 +1,428 @@
+name: build-jar
+
+# Actions tab -> build-jar -> Run workflow:
+#   jar_name      = name of the jar you want  (".jar" is added for you)
+#   project_name  = (optional) part of the folder / zip name to build, e.g. "Meow" -> finds Meow-Client.zip
+#   java_version  = 21 for Minecraft 1.21+, 17 for 1.18-1.20.4
+# Works for the Meow client (special build) and for any other Fabric/Gradle client zip or folder.
+
+on:
+  workflow_dispatch:
+    inputs:
+      jar_name:
+        description: 'Name for the output jar (".jar" is added for you)'
+        required: true
+        default: 'Meow-Client'
+        type: string
+      project_name:
+        description: 'Folder or zip name to find (part of the name is enough, blank = auto-detect)'
+        required: false
+        default: ''
+        type: string
+      java_version:
+        description: 'Java version (21 for MC 1.21+, 17 for older)'
+        required: false
+        default: '21'
+        type: string
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_VERSION: '9.2.0'
+  GRADLE_OPTS: >-
+    -Dorg.gradle.daemon=false
+    -Dorg.gradle.internal.http.connectionTimeout=120000
+    -Dorg.gradle.internal.http.socketTimeout=120000
+    -Dorg.gradle.internal.repository.max.retries=6
+    -Dorg.gradle.internal.repository.initial.backoff=1000
+    -Dorg.gradle.console=plain
+
+jobs:
+  build:
+    name: Build jar
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      jar_name: ${{ steps.name.outputs.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          lfs: true
+
+      # ---------- Inputs (sanitised; passed via env so they can never inject shell) ----------
+      - name: Resolve inputs
+        id: name
+        shell: bash
+        env:
+          INPUT_NAME: ${{ inputs.jar_name }}
+          INPUT_JAVA: ${{ inputs.java_version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          raw="${INPUT_NAME:-}"
+          if [ -z "$raw" ]; then
+            raw="meow-client"
+            [ "$REF_TYPE" = "tag" ] && raw="meow-client-${REF_NAME}"
+          fi
+          name=$(printf '%s' "$raw" | sed -E 's/\.jar$//I; s/[^A-Za-z0-9._-]+/-/g; s/^[-.]+//; s/-+$//')
+          [ -n "$name" ] || name="meow-client"
+          java=$(printf '%s' "${INPUT_JAVA:-21}" | tr -cd '0-9')
+          [ -n "$java" ] || java=21
+          echo "Output jar: ${name}.jar   Java: ${java}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "java=$java" >> "$GITHUB_OUTPUT"
+
+      # ---------- Find the project: loose folder anywhere in the repo, or inside any .zip ----------
+      - name: Locate project (folder or zip)
+        id: loc
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project_name }}
+        run: |
+          set -euo pipefail
+          hint=$(printf '%s' "${PROJECT_NAME:-}" | tr -cd 'A-Za-z0-9._ -')
+          [ -n "$hint" ] && echo "Looking for a project matching: '$hint'"
+
+          list_settings() {
+            find "$1" -maxdepth 5 \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/__MACOSX/*' \
+              -not -path '*/reference/*' -not -path '*/_unpacked/*' | sort || true
+          }
+          # first settings file whose path matches the hint (if a hint was given), else the first one
+          pick() {
+            local all; all=$(list_settings "$1")
+            [ -n "$all" ] || return 0
+            if [ -n "$hint" ]; then
+              local m; m=$(printf '%s\n' "$all" | grep -iF -- "$hint" | head -n1 || true)
+              [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
+            fi
+            printf '%s\n' "$all" | head -n1
+          }
+
+          settings=$(pick .)
+          # a hint that matches nothing loose should still look inside matching zips first
+          if [ -n "$hint" ] && [ -n "$settings" ] && ! printf '%s' "$settings" | grep -qiF -- "$hint"; then
+            echo "Loose project '$settings' does not match '$hint', checking zips too."
+            loose="$settings"; settings=""
+          else
+            loose=""
+          fi
+
+          if [ -z "$settings" ]; then
+            echo "Looking for .zip files to unpack..."
+            zips=$(find . -maxdepth 4 -iname '*.zip' -not -path './.git/*' -not -path './_unpacked/*' | sort || true)
+            if [ -n "$hint" ]; then   # zips matching the hint go first
+              zips=$( { printf '%s\n' "$zips" | grep -iF -- "$hint" || true; printf '%s\n' "$zips" | grep -ivF -- "$hint" || true; } )
+            fi
+            n=0
+            while IFS= read -r zipfile; do
+              [ -n "$zipfile" ] || continue
+              n=$((n+1))
+              echo "Trying $zipfile"
+              mkdir -p "_unpacked/$n"
+              unzip -q -o "$zipfile" -d "_unpacked/$n" || { echo "  could not unzip, skipping"; continue; }
+              settings=$(pick "_unpacked/$n")
+              [ -n "$settings" ] && { echo "  project found in $zipfile"; break; }
+            done <<< "$zips"
+            [ -n "$settings" ] || settings="$loose"
+          fi
+
+          if [ -z "$settings" ]; then
+            echo "::error::No settings.gradle found in the repo or in any .zip inside it."
+            echo "Repo contents:"; find . -maxdepth 3 -not -path './.git/*' | sort | head -100
+            echo "Fix: upload the project folder, or the project .zip, to the repo."
+            exit 1
+          fi
+          dir=$(dirname "$settings")
+          echo "Project directory: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          # Meow project = has the Meow GUI sources (gets the special build); anything else = generic build
+          if [ -f "$dir/src/main/java/cc/mochi/MeowMenu.java" ]; then
+            echo "Project type: Meow client"; echo "meow=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Project type: generic Gradle client"; echo "meow=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ================= Meow-only preparation =================
+      - name: Locate original jar
+        if: steps.loc.outputs.meow == 'true'
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p libs
+          if [ ! -f libs/meow-original.jar ]; then
+            echo "libs/meow-original.jar missing, searching for a Meow jar..."
+            root=$(pwd)
+            while IFS= read -r j; do
+              unzip -Z1 "$j" > "$RUNNER_TEMP/cand.list" 2>/dev/null || continue
+              if grep -qx 'cc/mochi/MeowMenu.class' "$RUNNER_TEMP/cand.list"; then
+                echo "Using $j"; cp "$j" libs/meow-original.jar; break
+              fi
+            done < <(find "$root" "$GITHUB_WORKSPACE" -maxdepth 4 -name '*.jar' \
+                       -not -path '*/build/*' -not -path '*/.git/*' -not -path '*/.gradle/*' | sort -u)
+          fi
+
+      - name: Preflight - required files (Meow)
+        if: steps.loc.outputs.meow == 'true'
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in build.gradle settings.gradle gradle.properties \
+                   libs/meow-original.jar \
+                   src/main/java/cc/mochi/MeowMenu.java \
+                   src/main/java/cc/mochi/meowgui/MeowGuiScreen.java \
+                   src/main/java/cc/mochi/meowgui/Gfx.java \
+                   src/main/java/cc/mochi/meowgui/KeyNames.java \
+                   src/main/java/cc/mochi/MeowWebGuard.java; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::Missing required file: $f"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          size=$(stat -c%s libs/meow-original.jar)
+          echo "meow-original.jar size: $size bytes"
+          if [ "$size" -lt 10000 ]; then
+            echo "::error file=libs/meow-original.jar::Jar is only $size bytes - looks like a Git LFS pointer or a bad upload."
+            exit 1
+          fi
+          unzip -tq libs/meow-original.jar >/dev/null \
+            || { echo "::error file=libs/meow-original.jar::Jar is corrupt / not a valid zip"; exit 1; }
+
+      # Patches Auto Mace in the original jar only if it is not patched yet (the script is a no-op otherwise).
+      - name: Patch Auto Mace (if needed)
+        if: steps.loc.outputs.meow == 'true'
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cls=cc/mochi/AutoMaceModule.class
+          # NOTE: never pipe into `grep -q` under pipefail (SIGPIPE -> false negatives); grep a file instead.
+          unzip -Z1 libs/meow-original.jar > "$RUNNER_TEMP/orig.list"
+          if ! grep -qx "$cls" "$RUNNER_TEMP/orig.list"; then
+            echo "No AutoMaceModule in the jar, nothing to patch."; exit 0
+          fi
+          unzip -p libs/meow-original.jar "$cls" > "$RUNNER_TEMP/automace.class"
+          if grep -aq 'MeowWebGuard' "$RUNNER_TEMP/automace.class"; then
+            echo "AutoMaceModule already patched."; exit 0
+          fi
+          if [ ! -f tools/patch_automace.py ]; then
+            echo "::warning::AutoMaceModule is not patched and tools/patch_automace.py is missing - skipping."
+            exit 0
+          fi
+          python3 tools/patch_automace.py libs/meow-original.jar "$RUNNER_TEMP/patched.jar"
+          unzip -tq "$RUNNER_TEMP/patched.jar" >/dev/null
+          mv "$RUNNER_TEMP/patched.jar" libs/meow-original.jar
+          echo "Patched."
+
+      # ================= Shared preflight =================
+      - name: Preflight - read versions
+        id: ver
+        shell: bash
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          get() { { grep -E "^$1=" gradle.properties 2>/dev/null || true; } | head -n1 | cut -d= -f2- | tr -d '[:space:]'; }
+          echo "mc=$(get minecraft_version)"   >> "$GITHUB_OUTPUT"
+          echo "yarn=$(get yarn_mappings)"     >> "$GITHUB_OUTPUT"
+          echo "loader=$(get loader_version)"  >> "$GITHUB_OUTPUT"
+
+      # Fails early (with the fix) if the Yarn build does not exist; only warns if Fabric meta is down.
+      - name: Preflight - verify Yarn mappings exist
+        shell: bash
+        env:
+          MC: ${{ steps.ver.outputs.mc }}
+          YARN: ${{ steps.ver.outputs.yarn }}
+        run: |
+          set -uo pipefail
+          if [ -z "$MC" ] || [ -z "$YARN" ]; then echo "No yarn_mappings in gradle.properties, skipping the Yarn check."; exit 0; fi
+          for i in 1 2 3; do
+            if body=$(curl -fsSL --max-time 30 "https://meta.fabricmc.net/v2/versions/yarn/${MC}"); then
+              if echo "$body" | grep -q "\"version\": *\"${YARN}\""; then
+                echo "Yarn ${YARN} found for Minecraft ${MC}."
+                exit 0
+              fi
+              latest=$(echo "$body" | grep -o '"version": *"[^"]*"' | head -n1 | cut -d'"' -f4)
+              echo "::error file=gradle.properties::yarn_mappings=${YARN} does not exist for ${MC}. Latest is: ${latest:-unknown}. Update yarn_mappings in gradle.properties."
+              exit 1
+            fi
+            echo "Fabric meta unreachable (attempt $i/3), retrying..."
+            sleep $((i * 5))
+          done
+          echo "::warning::Could not reach meta.fabricmc.net, skipping the Yarn check."
+          exit 0
+
+      # ---------- Toolchain ----------
+      - name: Set up Java ${{ steps.name.outputs.java }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ steps.name.outputs.java }}
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }}
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          build-root-directory: ${{ steps.loc.outputs.dir }}
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Show environment
+        run: |
+          java -version
+          gradle --version
+
+      # ---------- Build (3 attempts so flaky downloads do not fail the run) ----------
+      # Meow: `meowJar`.  Anything else: `build` (uses the project's own ./gradlew when it has one).
+      - name: Build jar
+        shell: bash
+        env:
+          IS_MEOW: ${{ steps.loc.outputs.meow }}
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -uo pipefail
+          GR=gradle; ARGS=""
+          if [ "$IS_MEOW" != "true" ] && [ -f gradlew ]; then chmod +x gradlew; GR=./gradlew; fi
+          if [ "$IS_MEOW" = "true" ]; then TASK=meowJar; else TASK=build; ARGS="-x test"; fi
+          for attempt in 1 2 3; do
+            echo "::group::Build attempt $attempt/3 ($GR $TASK)"
+            if $GR $TASK $ARGS --no-daemon --stacktrace --warning-mode=summary; then
+              echo "::endgroup::"
+              echo "Build succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::Build attempt $attempt failed."
+            [ "$attempt" -lt 3 ] && { echo "Retrying in $((attempt * 15))s..."; sleep $((attempt * 15)); }
+          done
+          echo "::error::Build failed after 3 attempts. Check the log above (common causes: Loom version, Yarn build, wrong java_version)."
+          exit 1
+
+      # ---------- Verify, then name the jar ----------
+      - name: Verify jar and apply name
+        id: out
+        shell: bash
+        env:
+          JAR_NAME: ${{ steps.name.outputs.name }}
+          IS_MEOW: ${{ steps.loc.outputs.meow }}
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: |
+          set -euo pipefail
+          listing="$RUNNER_TEMP/out.list"
+
+          if [ "$IS_MEOW" = "true" ]; then
+            jar=build/libs/meow-client-vue.jar
+          else
+            # the real mod jar: newest jar in build/libs that is not sources/dev/javadoc
+            jar=$(ls -t build/libs/*.jar 2>/dev/null | grep -Ev -- '-(sources|dev|javadoc|all-dev)\.jar$' | head -n1 || true)
+          fi
+          [ -n "$jar" ] && [ -f "$jar" ] || { echo "::error::No jar was produced"; ls -la build/libs || true; exit 1; }
+          echo "Jar: $jar"
+          unzip -tq "$jar" >/dev/null || { echo "::error::Output jar is corrupt"; exit 1; }
+          echo "Output size: $(stat -c%s "$jar") bytes"
+          unzip -Z1 "$jar" > "$listing"
+
+          if [ "$IS_MEOW" = "true" ]; then
+            for c in cc/mochi/MeowMenu.class \
+                     cc/mochi/meowgui/MeowGuiScreen.class \
+                     cc/mochi/meowgui/Gfx.class \
+                     cc/mochi/meowgui/KeyNames.class \
+                     cc/mochi/meowgui/ThemeBridge.class \
+                     cc/mochi/FriendManager.class \
+                     cc/mochi/MeowWebGuard.class \
+                     fabric.mod.json; do
+              grep -qx "$c" "$listing" || { echo "::error::Missing $c in output jar"; exit 1; }
+            done
+            orig_count=$(unzip -Z1 libs/meow-original.jar | grep -c '\.class$' || true)
+            out_count=$(grep -c '\.class$' "$listing" || true)
+            echo "Classes: original=$orig_count output=$out_count"
+            [ "$out_count" -ge "$orig_count" ] || { echo "::error::Output has fewer classes than the original jar"; exit 1; }
+            if grep -qx 'cc/mochi/AutoMaceModule.class' "$listing"; then
+              unzip -p "$jar" cc/mochi/AutoMaceModule.class > "$RUNNER_TEMP/am.class"
+              grep -aq 'MeowWebGuard' "$RUNNER_TEMP/am.class" \
+                || { echo "::error::AutoMaceModule is not patched (no MeowWebGuard reference)"; exit 1; }
+            fi
+          else
+            # a client that loads must carry a mod descriptor
+            if ! grep -Eqx 'fabric\.mod\.json|quilt\.mod\.json|META-INF/mods\.toml|META-INF/neoforge\.mods\.toml|plugin\.yml' "$listing"; then
+              echo "::warning::No mod descriptor (fabric.mod.json / mods.toml) in the jar - the launcher will not load it."
+            fi
+          fi
+
+          if grep -Eq '^META-INF/.*\.(SF|RSA|DSA)$' "$listing"; then
+            echo "::error::Stale signature files found in output jar"; exit 1
+          fi
+
+          # What the launcher needs, printed so a "menu does not open" problem can be diagnosed from the log
+          if grep -qx 'fabric.mod.json' "$listing"; then
+            unzip -p "$jar" fabric.mod.json > "$RUNNER_TEMP/fmj.json"
+            python3 - "$RUNNER_TEMP/fmj.json" <<'PY' || true
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print("Mod id:", d.get("id"), "| version:", d.get("version"))
+          print("Needs:", ", ".join(f"{k} {v}" for k, v in (d.get("depends") or {}).items()))
+          if any(k.startswith("fabric-") for k in (d.get("depends") or {})) and "fabric-api" not in (d.get("depends") or {}):
+              print("NOTE: install Fabric API in the launcher/mods folder, or the client will not load.")
+          PY
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$jar" "$GITHUB_WORKSPACE/dist/${JAR_NAME}.jar"
+          echo "Jar verified OK -> dist/${JAR_NAME}.jar"
+
+      # ---------- Outputs ----------
+      - name: Upload jar
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: dist/${{ steps.name.outputs.name }}.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-reports
+          path: |
+            ${{ steps.loc.outputs.dir }}/build/reports/**
+            ${{ steps.loc.outputs.dir }}/build/tmp/**/*.log
+            hs_err_pid*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Push a tag like v1.0 and the jar is attached to a GitHub Release automatically
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: ${{ needs.build.outputs.jar_name }}
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.jar
+          generate_release_notes: true
+          fail_on_unmatched_files: true
